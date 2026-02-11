@@ -12,6 +12,7 @@ from pypdf import PdfReader
 from openai import OpenAI
 from agents import Agent, Runner, trace, ModelSettings
 from agents.mcp import MCPServerStdio
+from pydantic import BaseModel, Field
 
 MODEL_NAME = "gpt-5-nano"
 PDF_PATH = "Nutuk_modern.pdf"
@@ -21,6 +22,59 @@ OVERLAP = 100
 MAX_TURNS = 10
 
 openai = OpenAI()
+
+from pydantic import BaseModel, Field
+
+# ... existing imports ...
+
+class RankOrder(BaseModel):
+    order: list[int] = Field(
+        description="The order of relevance of chunks, from most relevant to least relevant, by chunk id number"
+    )
+
+def rerank(question, documents, metadatas):
+    """
+    Re-ranks retrieved documents based on relevance to the question.
+    """
+    print("--- Reranking Chunks ---")
+    
+    user_prompt = f"The user has asked the following question:\n\n{question}\n\n"
+    user_prompt += "Order all the chunks of text by relevance to the question, from most relevant to least relevant.\n"
+    user_prompt += "Here are the chunks:\n\n"
+    
+    for index, doc in enumerate(documents):
+        # Using 1-based indexing for the LLM to make it easier
+        user_prompt += f"# CHUNK ID {index + 1}:\n{doc}\n\n"
+    
+    user_prompt += "Reply only with the list of ranked chunk ids."
+
+    messages = [
+        {"role": "system", "content": "You are a document re-ranker. You must rank the provided chunks based on relevance to the question."},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        # Call OpenAI with Structured Outputs
+        response = openai.chat.completions.create(
+            model=MODEL_NAME, 
+            messages=messages,
+            response_format=RankOrder,
+        )
+        
+        reply = response.choices[0].message.content
+        order = RankOrder.model_validate_json(reply).order
+
+        final_indices = [i - 1 for i in order]
+        
+        ranked_docs = [documents[i] for i in final_indices]
+        ranked_metas = [metadatas[i] for i in final_indices]
+        
+        print(f"Reranked Order: {rank_response.order}")
+        return ranked_docs, ranked_metas
+
+    except Exception as e:
+        print(f"Reranking failed: {e}. Returning original order.")
+        return documents, metadatas
 
 def clean_text(text):
     """
@@ -147,13 +201,31 @@ async def chat(message, history):
     collection = client.get_collection(name="nutuk_collection")
 
     query_embedding = encoder.encode(message).tolist()
-    results = collection.query(query_embeddings=[query_embedding], n_results=5)
+    # results = collection.query(query_embeddings=[query_embedding], n_results=5)
 
-    print("--- Retrieving Context ---")
+    # Increase n_results slightly (e.g., to 10) to give the reranker more candidates to choose from
+    results = collection.query(query_embeddings=[query_embedding], n_results=10)
+    initial_docs = results['documents'][0]
+    initial_metas = results['metadatas'][0]
+
+    # --- RERANKING STEP ---
+    ranked_docs, ranked_metas = rerank(message, initial_docs, initial_metas)
+    
+    # Slice to keep only the top 5 after reranking if you want to save context window
+    ranked_docs = ranked_docs[:5]
+    ranked_metas = ranked_metas[:5]
+
+    print("Retrieving Context (Post-Rerank)")
     retrieved_context = ""
-    for i, doc in enumerate(results['documents'][0]):
-        page_num = results['metadatas'][0][i]['page']
+    for i, doc in enumerate(ranked_docs):
+        page_num = ranked_metas[i]['page']
         retrieved_context += f"[Sayfa {page_num}]: {doc}" + "\n"
+
+    # print("--- Retrieving Context ---")
+    # retrieved_context = ""
+    # for i, doc in enumerate(results['documents'][0]):
+    #     page_num = results['metadatas'][0][i]['page']
+    #     retrieved_context += f"[Sayfa {page_num}]: {doc}" + "\n"
 
     system_prompt = f"""
 
